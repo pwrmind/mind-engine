@@ -1,0 +1,20 @@
+# pyproject.toml
+[project]
+name = "mind-engine"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26",
+    "torch==2.14.0",
+    "sentence-transformers>=2.7",   # опционально — только для EmbeddingEncoder
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
