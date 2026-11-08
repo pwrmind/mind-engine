@@ -1,26 +1,17 @@
-"""train_on_history.py — warm-start + fine-tune (v3, surgical blend).
+"""train_on_history.py — warm-start + fine-tune (v4, с MSComplexTasks).
 
-Ключевое отличие от v2:
-    fine_targets строится НЕ через (v2 + λ·session)/sum, а через
-    перемешивание ТОЛЬКО task-блока с сохранением его массы:
+Новые возможности:
+    --session-source mscomplex — сессии из MSComplexTasks DAG.
+        Топологическая сортировка даёт логически правильный порядок
+        подзадач, а не просто соседство по ListTitle.
 
-        fine[:n_tasks, :n_tasks] = (1-λ)·v2_block + λ·session_block_scaled
+    --mscomplex-path — путь к task_subtask_dataset.json (default).
 
-    где session_block_scaled масштабирован так, чтобы сумма его столбцов
-    была равна сумме столбцов v2_block. Контекст (time/loc) НЕ трогается.
-
-    Результат: task-часть перемешана между similarity и session, но её
-    общий вес в колонке сохранён (S_a), поэтому контекст не размывается.
-    С λ=0.3: task-блок = 70% similarity + 30% session, контекст = 100%.
-
-Диагностика: если fine-tune на similarity-сессиях (циркулярный источник),
-    ожидаемый эффект ≈ 0 — similarity и session шумят одну и ту же
-    информацию. Только list_title или реальная история дают ортогональный
-    сигнал, который может улучшить модель.
+    --mscomplex-max-len — максимальная длина сессии (обрезка).
 
 Запуск:
+    uv run train_on_history.py --session-source mscomplex
     uv run train_on_history.py --session-source list_title
-    uv run train_on_history.py --session-source list_title --fine-lambda 0.3
     uv run train_on_history.py --history-file mind_history.json
 """
 from __future__ import annotations
@@ -37,6 +28,11 @@ import torch.nn.functional as F
 from torch.optim import Adam
 
 from mind_engine import MindEngine, Concept, pick_device
+from mscomplex_loader import (
+    load_mscomplex,
+    build_sessions_from_mscomplex,
+    print_example_sessions,
+)
 
 
 TIME_LABELS = [
@@ -277,6 +273,59 @@ def sessions_from_list_titles(task_list_title, task_ids, *,
     return sessions
 
 
+def sessions_from_mscomplex_entries(
+    entries: list[dict],
+    task_ids: list[str],
+    *,
+    min_subtasks: int = 2,
+    max_subtasks: int = 8,
+    verbose: bool = True,
+) -> list[list[int]]:
+    """MSComplexTasks → сессии индексов task_ids.
+
+    Подзадачи сопоставляются с task_ids по нормализованному названию
+    (lowercase, strip). Если подзадача не найдена в task_ids — она
+    пропускается, но если после фильтрации осталось >= min_subtasks,
+    сессия сохраняется.
+    """
+    name_to_idx = {
+        str(t).strip().lower(): i for i, t in enumerate(task_ids)
+    }
+    raw_sessions = build_sessions_from_mscomplex(
+        entries,
+        min_subtasks=min_subtasks,
+        max_subtasks=max_subtasks,
+        require_order=True,
+        verbose=verbose,
+    )
+    sessions: list[list[int]] = []
+    matched_subtasks = 0
+    total_subtasks = 0
+    for s in raw_sessions:
+        total_subtasks += len(s)
+        idx_session = []
+        for name in s:
+            key = str(name).strip().lower()
+            if key in name_to_idx:
+                idx = name_to_idx[key]
+                if not idx_session or idx_session[-1] != idx:
+                    idx_session.append(idx)
+                matched_subtasks += 1
+        if len(idx_session) >= min_subtasks:
+            sessions.append(idx_session)
+
+    if verbose:
+        print(f"  MSComplexTasks → {len(sessions)} сессий после матчинга "
+              f"({matched_subtasks}/{total_subtasks} подзадач найдено в task_ids)")
+        if sessions:
+            avg = sum(len(s) for s in sessions) / len(sessions)
+            print(f"  средняя длина после матчинга: {avg:.1f}")
+            print_example_sessions(
+                [[task_ids[i] for i in s] for s in sessions], n=3,
+            )
+    return sessions
+
+
 def pairs_from_sessions(sessions):
     pairs = []
     for s in sessions:
@@ -343,22 +392,10 @@ def build_session_targets(pairs, n_tasks, *, smoothing=1e-3):
 
 def build_fine_targets(v2_targets, session_targets, *, n_tasks, fine_lambda,
                        device=torch.device("cpu")):
-    """Перемешивает task-блок, СОХРАНЯЯ его массу. Контекст не трогается.
-
-    v2_block[a] — столбец для источника a, сумма = S_a (например 0.3).
-    session_block[a] — распределение по task-соседям, сумма = 1.
-
-    session_scaled = session_block * S_a   (та же масса)
-    blended[a] = (1-λ)*v2_block[a] + λ*session_scaled[a]   (сумма та же S_a)
-
-    Поэтому итоговая сумма колонки fine_targets[:, a] = 1 (S_a в блоке
-    + контекст + 1-S_a), как и было. Никакой renormalization не нужен.
-    """
     fine = v2_targets.clone()
-    v2_block = v2_targets[:n_tasks, :n_tasks].clone()             # [n_t, n_t]
-    col_mass = v2_block.sum(dim=0, keepdim=True).clamp_min(1e-3)  # [1, n_t], sum=S_a
-
-    session_scaled = session_targets * col_mass                    # [n_t, n_t]
+    v2_block = v2_targets[:n_tasks, :n_tasks].clone()
+    col_mass = v2_block.sum(dim=0, keepdim=True).clamp_min(1e-3)
+    session_scaled = session_targets * col_mass
     blended = (1 - fine_lambda) * v2_block + fine_lambda * session_scaled
     fine[:n_tasks, :n_tasks] = blended
     return fine.to(device)
@@ -547,33 +584,31 @@ def main():
 
     parser.add_argument("--fine-epochs", type=int, default=200)
     parser.add_argument("--fine-lr", type=float, default=0.002)
-    parser.add_argument("--fine-lambda", type=float, default=0.3,
-                        help="доля session в task-блоке (0..1), масса сохраняется")
+    parser.add_argument("--fine-lambda", type=float, default=0.3)
     parser.add_argument("--fine-patience", type=int, default=30)
     parser.add_argument("--class-balance", type=float, default=0.5)
 
     parser.add_argument("--session-source",
-                        choices=["similarity", "list_title", "history"],
-                        default="list_title",
-                        help="similarity=циркулярно (sanity), "
-                             "list_title=ортогонально, history=реальные данные")
+                        choices=["similarity", "list_title", "mscomplex", "history"],
+                        default="mscomplex",
+                        help="mscomplex — реальный DAG из Wunderlist")
     parser.add_argument("--generate-sessions", type=int, default=3000)
     parser.add_argument("--session-len", type=int, default=3)
     parser.add_argument("--session-top-k", type=int, default=8)
     parser.add_argument("--session-temp", type=float, default=0.5)
     parser.add_argument("--history-file", default=None)
+    parser.add_argument("--mscomplex-path", default="task_subtask_dataset.json")
+    parser.add_argument("--mscomplex-min-len", type=int, default=2)
+    parser.add_argument("--mscomplex-max-len", type=int, default=8)
 
     parser.add_argument("--no-warm-start", action="store_true")
     parser.add_argument("--no-fine-tune", action="store_true")
-    parser.add_argument("--keep-warm", action="store_true",
-                        help="сохранить модель, только если fine-tune "
-                             "не ухудшил warm-metrics")
     parser.add_argument("--save-model", default="mind_latte.pt")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  train_on_history.py — surgical blend")
+    print("  train_on_history.py — MSComplexTasks integration")
     print("=" * 70)
     device = pick_device("auto")
     print(f"  device: {device}")
@@ -620,6 +655,14 @@ def main():
         print(f"  из {args.history_file}")
         pairs_all = pairs_from_history_json(args.history_file, task_ids)
         sessions = [[a, b] for a, b in pairs_all]
+    elif args.session_source == "mscomplex":
+        print(f"  MSComplexTasks: {args.mscomplex_path}")
+        entries = load_mscomplex(args.mscomplex_path)
+        sessions = sessions_from_mscomplex_entries(
+            entries, task_ids,
+            min_subtasks=args.mscomplex_min_len,
+            max_subtasks=args.mscomplex_max_len,
+        )
     elif args.session_source == "list_title":
         print(f"  ListTitle-based ({args.generate_sessions})")
         sessions = sessions_from_list_titles(
@@ -638,12 +681,15 @@ def main():
             temperature=args.session_temp, seed=args.seed,
         )
     if not sessions:
-        print("  нет сессий")
-        return
-    s_train, s_val, s_test = split_sessions(sessions, seed=args.seed)
-    p_train = pairs_from_sessions(s_train)
-    p_val = pairs_from_sessions(s_val)
-    p_test = pairs_from_sessions(s_test)
+        print("  нет сессий — fine-tune пропущен")
+        sessions_train, sessions_val, sessions_test = [], [], []
+    else:
+        sessions_train, sessions_val, sessions_test = split_sessions(
+            sessions, seed=args.seed,
+        )
+    p_train = pairs_from_sessions(sessions_train)
+    p_val = pairs_from_sessions(sessions_val)
+    p_test = pairs_from_sessions(sessions_test)
     print(f"  split: train={len(p_train)}  val={len(p_val)}  test={len(p_test)}")
 
     print("\n[7] Baseline (random):")
@@ -679,8 +725,6 @@ def main():
             v2_targets, session_targets,
             n_tasks=n_tasks, fine_lambda=args.fine_lambda,
         )
-        before_state = (mind.assoc_U.detach().clone(),
-                        mind.assoc_V.detach().clone())
 
         def val_hit3():
             return session_hit_at_k(mind, p_val, n_tasks, k=3) if p_val else 0.0
@@ -705,21 +749,6 @@ def main():
               f"time@1={fine_metrics['time@1']:.3f}  "
               f"loc@1={fine_metrics['loc@1']:.3f}  "
               f"task_ret={fine_metrics['task_ret']:.3f}")
-
-        # Проверка: улучшился ли fine-tune хоть по одной метрике без потерь
-        regressed = (
-            fine_metrics["task_ret"] < warm_metrics["task_ret"] - 0.03 or
-            fine_metrics["time@1"] < warm_metrics["time@1"] - 0.03 or
-            fine_metrics["loc@1"] < warm_metrics["loc@1"] - 0.03
-        )
-        improved = fine_metrics["hit@3"] > warm_metrics["hit@3"] + 0.02
-        print(f"  improved={improved}  regressed={regressed}")
-
-        if args.keep_warm and (regressed or not improved):
-            print("  --keep-warm: восстанавливаю warm-start state")
-            mind.assoc_U.data = before_state[0]
-            mind.assoc_V.data = before_state[1]
-            fine_metrics = warm_metrics
 
     print("\n[12] Итог:")
     print(f"  {'этап':20s} {'hit@5':>7s} {'time@1':>7s} {'loc@1':>7s} {'task_ret':>9s}")
